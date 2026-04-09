@@ -1,19 +1,16 @@
-use crate::order_book::OrderBook;
+use crate::events::{EventHandler, MarketEvent};
+use std::cell::RefCell; // 用于在不可变方法中改变状态 // 引入事件相关模块
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Signal {
     Buy,
     Sell,
     Hold, // 持仓不动
 }
 
-pub trait Strategy {
-    fn name(&self) -> &str;
-    fn on_market_data(&mut self, ob: &OrderBook) -> Signal;
-}
-
+// 策略结构体
 pub struct MeanReversionStrategy {
-    price_history: Vec<f64>,
+    price_history: RefCell<Vec<f64>>,
     window_size: usize,
     threshold: f64,
 }
@@ -21,60 +18,76 @@ pub struct MeanReversionStrategy {
 impl MeanReversionStrategy {
     pub fn new(window_size: usize, threshold: f64) -> Self {
         Self {
-            price_history: Vec::with_capacity(window_size),
+            price_history: RefCell::new(Vec::with_capacity(window_size)),
             window_size,
             threshold,
         }
     }
 
-    // 辅助方法：计算简单移动平均
+    // 辅助方法：计算简单移动平均 (SMA)
     fn calculate_sma(&self) -> f64 {
-        if self.price_history.is_empty() {
+        // 借用内部数据
+        let history = self.price_history.borrow();
+        if history.is_empty() {
             return 0.0;
         }
-        let sum: f64 = self.price_history.iter().sum();
-        sum / self.price_history.len() as f64
+        let sum: f64 = history.iter().sum();
+        sum / history.len() as f64
+    }
+
+    // 供外部查询当前信号状态
+    pub fn get_signal(&self) -> Signal {
+        let history = self.price_history.borrow();
+        if history.is_empty() {
+            return Signal::Hold;
+        }
+
+        let sma = history.iter().sum::<f64>() / history.len() as f64;
+        let last_price = *history.last().unwrap();
+
+        if last_price < sma - self.threshold {
+            Signal::Buy
+        } else if last_price > sma + self.threshold {
+            Signal::Sell
+        } else {
+            Signal::Hold
+        }
+    }
+
+    pub fn get_last_price(&self) -> Option<f64> {
+        // 借用内部的 history
+        let history = self.price_history.borrow();
+        // 返回最后一个价格的副本
+        history.last().copied()
     }
 }
 
-impl Strategy for MeanReversionStrategy {
-    fn name(&self) -> &str {
-        "MeanReversion_v1"
-    }
+// 4. 实现 EventHandler Trait (事件驱动的核心)
+impl EventHandler for MeanReversionStrategy {
+    // 当事件总线推送 MarketEvent 时，这个方法会被自动调用
+    fn on_event(&self, event: &MarketEvent) {
+        let current_price = event.tick.price;
 
-    fn on_market_data(&mut self, ob: &OrderBook) -> Signal {
-        // 1. 数据清洗：如果价格无效，直接忽略
-        if !ob.is_ready() {
-            return Signal::Hold;
+        // 5. 核心修改：使用 borrow_mut() 获取可变借用
+        // 这相当于说：“虽然我是只读的(&self)，但我申请打开盒子修改里面的历史数据”
+        let mut history = self.price_history.borrow_mut();
+
+        // --- 策略逻辑开始 ---
+
+        // 1. 更新历史数据 (滑动窗口)
+        history.push(current_price);
+        if history.len() > self.window_size {
+            history.remove(0); // 移除最旧的数据
         }
 
-        let current_price = ob.last_price;
+        // 2. 计算指标 (SMA)
+        // 注意：这里我们需要先释放上面的可变借用 history，或者直接用 self.calculate_sma()
+        // 为了安全，我们显式 drop 掉 history，或者直接用 calculate_sma 方法
+        drop(history);
 
-        // 2. 更新历史数据
-        self.price_history.push(current_price);
-        if self.price_history.len() > self.window_size {
-            self.price_history.remove(0); // 移除最旧的数据，保持窗口大小
-        }
-
-        // 3. 计算指标
         let sma = self.calculate_sma();
-
         if sma == 0.0 {
-            return Signal::Hold;
+            return;
         }
-
-        // 4. 产生信号
-        // 价格低于均线 - 阈值 -> 买入（抄底）
-        if current_price < sma - self.threshold {
-            println!("   🧠 [Strategy] Price {:.2} is LOW (SMA: {:.2}). Signal: BUY", current_price, sma);
-            return Signal::Buy;
-        }
-        // 价格高于均线 + 阈值 -> 卖出（逃顶）
-        else if current_price > sma + self.threshold {
-            println!("   🧠 [Strategy] Price {:.2} is HIGH (SMA: {:.2}). Signal: SELL", current_price, sma);
-            return Signal::Sell;
-        }
-
-        Signal::Hold
     }
 }

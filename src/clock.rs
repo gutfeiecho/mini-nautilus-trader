@@ -1,5 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::types::Tick;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(dead_code)]
 pub struct Clock {
@@ -9,7 +9,10 @@ pub struct Clock {
 
 impl Clock {
     pub fn new(name: String) -> Self {
-        Self { name, current_price: 100.0 }
+        Self {
+            name,
+            current_price: 100.0,
+        }
     }
 
     // 注意：这里加上了 pub，因为 main.rs 需要调用它

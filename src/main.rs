@@ -1,35 +1,36 @@
-use std::{
-    cell::RefCell,
-    rc::Rc,
-};
-
 // 声明模块
 mod clock;
-mod cache;
-mod types;
+mod events;
 mod order_book;
+mod orders;
+mod portfolio;
 mod strategy;
+mod types;
+mod utils;
 
 // 引入模块中的具体内容
 use clock::Clock;
-use cache::Cache;
+use events::{MarketEvent, MessageBus};
 use order_book::OrderBook;
-use strategy::{Strategy, MeanReversionStrategy, Signal};
+use orders::{Order, OrderSide};
+use portfolio::Portfolio;
+use std::{cell::RefCell, rc::Rc};
+use strategy::{MeanReversionStrategy, Signal};
+use utils::{CsvRow, read_csv_file};
 
-// 1. 定义最基础的数据结构
-// 模拟数据引擎
+// 定义数据引擎
 struct DataEngine {
     is_running: bool,
     clock: Rc<RefCell<Clock>>,
-    order_book: Rc<RefCell<OrderBook>>
+    message_bus: Rc<RefCell<MessageBus>>,
 }
 
 impl DataEngine {
-    fn new(clock: Rc<RefCell<Clock>>, order_book: Rc<RefCell<OrderBook>>) -> Self {
+    fn new(clock: Rc<RefCell<Clock>>, message_bus: Rc<RefCell<MessageBus>>) -> Self {
         Self {
             is_running: false,
             clock,
-            order_book,
+            message_bus,
         }
     }
 
@@ -46,34 +47,35 @@ impl DataEngine {
     pub fn process_tick(&self) {
         // 1. 借用clock，生成一个tick
         let tick = self.clock.borrow_mut().generate_tick();
-        println!("📈 [DataEngine] Received Tick: {} @ {} (at {})", tick.symbol, tick.price, tick.timestamp);
-        
-        // 2. 更新订单簿
-        self.order_book.borrow_mut().update(&tick);
+        println!(
+            "📈 [DataEngine] Received Tick: {} @ {} (at {})",
+            tick.symbol, tick.price, tick.timestamp
+        );
 
-        // 3. 打印详细日志
-        let ob = self.order_book.borrow();
-        if ob.is_ready() {
-            println!("📈 [DataEngine] Tick: {} | Last: {:.2} | Bid: {:.2} | Ask: {:.2}", tick.symbol, ob.last_price, ob.best_bid, ob.best_ask);
-        }
+        // 2. 构造事件
+        let event = MarketEvent { tick };
+
+        // 3. 发布事件到总线
+        // 这里总线会通知所有订阅者（策略）
+        self.message_bus.borrow().publish(&event);
     }
 }
 
-// 模拟执行引擎
+// 定义执行引擎
 struct ExecutionEngine {
     is_running: bool,
     /*
-    * Rc: 引用计数，负责多人共享
-    * RefCell: 内部可变形的安全箱。它在运行时检查借用规则。
-    */
-    cache: Rc<RefCell<Cache>>,
+     * Rc: 引用计数，负责多人共享
+     * RefCell: 内部可变形的安全箱。它在运行时检查借用规则。
+     */
+    portfolio: Rc<RefCell<Portfolio>>,
 }
 
 impl ExecutionEngine {
-    fn new(cache: Rc<RefCell<Cache>>) -> Self {
+    fn new(portfolio: Rc<RefCell<Portfolio>>) -> Self {
         Self {
             is_running: false,
-            cache,
+            portfolio,
         }
     }
     // 参数&mut self: 给方法“修改权”
@@ -82,9 +84,17 @@ impl ExecutionEngine {
         // self.cache.borrow(): 打开“安全箱”
         // borrow()是RefCell提供的一个方法。它的作用是“我要打开这个箱子，借用里面的Cache对象。”
         // 返回一个智能指针（类型叫Ref<Cache>）
-        let cache_ref = self.cache.borrow(); // 1. 拿到钥匙，并保存起来
-        let data = cache_ref.get_data();     // 2. 用钥匙开门，拿到数据
-        println!("[ExecutionEngine] Started, reading cache: {}", data);
+        // let cache_ref = self.cache.borrow(); // 1. 拿到钥匙，并保存起来
+        // let data = cache_ref.get_data();     // 2. 用钥匙开门，拿到数据
+        // println!("[ExecutionEngine] Started, reading cache: {}", data);
+        println!("[ExecutionEngine] Started");
+    }
+
+    pub fn submit_order(&self, order: &Order) {
+        println!("   📝 [ExecEngine] Processing Order: {:?}", order);
+        // 模拟撮合：假设订单立即以当前价格成交（市价单）
+        // 在真实系统中，这里会去匹配 OrderBook
+        self.portfolio.borrow_mut().on_order_filled(order);
     }
 
     fn stop(&mut self) {
@@ -93,53 +103,62 @@ impl ExecutionEngine {
     }
 }
 
-// 2. 实现最小化的 Nautilus Kernel
+// 实现最小化的 Nautilus Kernel
 #[allow(dead_code)]
 struct MiniKernel {
     // 核心组件
     clock: Rc<RefCell<Clock>>,
-    cache: Rc<RefCell<Cache>>,
-    
-    // 引擎
+
+    // 数据引擎
     data_engine: DataEngine,
+
+    // 执行引擎
     exec_engine: ExecutionEngine,
 
     // 订单簿
     order_book: Rc<RefCell<OrderBook>>,
 
-    // 策略模块
-    strategy: Box<dyn Strategy>, // 使用Box来持有trait对象
+    // 事件总线
+    message_bus: Rc<RefCell<MessageBus>>,
+
+    // 策略
+    strategy: Rc<RefCell<MeanReversionStrategy>>,
 
     // 状态
     ts_started: Option<u64>,
+
+    // 账户
+    portfolio: Rc<RefCell<Portfolio>>,
 }
 
 impl MiniKernel {
     // 构造函数：组装所有部件
     pub fn new() -> Self {
-        println!("Building MiniKernel...");
-
         // 1. 创建基础服务
         let clock = Rc::new(RefCell::new(Clock::new("TestClock".to_string())));
-        let cache = Rc::new(RefCell::new(Cache::new()));
+        let message_bus = Rc::new(RefCell::new(MessageBus::new()));
 
         // 2. 创建订单簿
         let order_book = Rc::new(RefCell::new(OrderBook::new("BTC/USDT")));
 
-        // 3. 将基础服务注入引擎
-        let data_engine = DataEngine::new(clock.clone(), order_book.clone());
-        let exec_engine = ExecutionEngine::new(cache.clone());
+        // 3. 初始化策略
+        let strategy = Rc::new(RefCell::new(MeanReversionStrategy::new(5, 0.2)));
 
-        // 4. 初始化策略
-        let strategy = Box::new(MeanReversionStrategy::new(5, 0.2));
+        message_bus.borrow_mut().subscribe(strategy.clone());
+
+        // 4. 将基础服务注入引擎
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(10000.0, "BTC/USDT")));
+        let data_engine = DataEngine::new(clock.clone(), message_bus.clone());
+        let exec_engine = ExecutionEngine::new(portfolio.clone());
 
         Self {
             clock,
-            cache,
             data_engine,
             exec_engine,
+            portfolio,
             order_book,
             strategy,
+            message_bus,
             ts_started: None,
         }
     }
@@ -160,20 +179,18 @@ impl MiniKernel {
         for _i in 1..=20 {
             self.data_engine.process_tick();
 
-            // 策略思考
-            // 借用订单簿，传给策略
-            let ob_ref = self.order_book.borrow();
+            let signal = self.strategy.borrow().get_signal();
 
-            println!("   🧠 [Strategy: {}] Processing...", self.strategy.name());
-            let signal = self.strategy.on_market_data(&ob_ref); 
+            let current_price = self.strategy.borrow().get_last_price().unwrap_or(0.0);
 
-            if signal != Signal::Hold {
-                println!("   🚀 [Kernel] Executing signal: {:?}", signal);
-            }
-            // 释放借用
-            drop(ob_ref);
+            let side = if signal == Signal::Buy {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
+            let order = Order::new("BTC/USDT", side, 1, current_price);
 
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.exec_engine.submit_order(&order);
         }
 
         println!("🛑 Loop finished, stopping kernel...");
@@ -192,12 +209,17 @@ impl MiniKernel {
     }
 }
 
-// 3. 主函数
-fn main() {
+// 主函数
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 测试读取csv数据
+    let rows: Vec<CsvRow> = read_csv_file("assets/BTCUSDT_1h.csv")?.collect();
+    println!("📚 [Main] Loaded {} rows from CSV", rows.len());
+
     // 创建内核实例
     let mut kernel = MiniKernel::new();
-    
+
     // 启动系统
     kernel.start();
-    
+
+    Ok(())
 }

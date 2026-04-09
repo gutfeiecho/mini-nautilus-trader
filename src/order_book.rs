@@ -1,6 +1,6 @@
 use crate::types::Tick;
 
-#[derive(Debug)]    // 宏1:自动生成Debug代码
+#[derive(Debug)] // 宏1:自动生成Debug代码
 #[allow(dead_code)] // 宏2:告诉编译器忽略“未使用字段”的警告 
 pub struct OrderBook {
     pub symbol: &'static str,
@@ -14,6 +14,7 @@ pub struct OrderBook {
     pub updates: u64,
 }
 
+#[allow(dead_code)]
 impl OrderBook {
     pub fn new(symbol: &'static str) -> Self {
         Self {
