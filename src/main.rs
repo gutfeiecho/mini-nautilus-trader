@@ -17,6 +17,93 @@ use portfolio::Portfolio;
 use std::{cell::RefCell, rc::Rc};
 use strategy::{MeanReversionStrategy, Signal};
 use utils::{CsvRow, read_csv_file};
+use zmq;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+
+// 定义一个结构体来接收 JSON 数据
+// 字段名要和 Python 发送的 key 对应
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct TickData {
+    symbol: String,
+    price: String, // 币安发过来是字符串，Rust 里可以转 f64
+    qty: String,
+    time: u64,
+}
+
+// 定义K线结构
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct Candle {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    start_time: u64,
+    is_closed: bool,
+}
+
+impl Candle {
+    fn new(price: f64, qty: f64, time: u64) -> Self {
+        Self {
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: qty,
+            start_time: time,
+            is_closed: false,
+        }
+    }
+
+    // 更新K线
+    fn update(&mut self, price: f64, qty: f64) {
+        self.close = price;
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.volume += qty;
+    }
+}
+
+// 定义合成器
+struct CandleBuilder {
+    // 存储不同交易对的当前K线
+    active_candles: HashMap<String, Candle>,
+    interval_secs: u64, // k线周期
+}
+
+impl CandleBuilder {
+    fn new(interval_secs: u64) -> Self {
+        Self {
+            active_candles: HashMap::new(),
+            interval_secs,
+        }
+    }
+
+    fn on_tick(&mut self, symbol: &str, price: f64, qty: f64, time: u64) {
+        // 对齐时间戳
+        let window_start = (time / 1000 / self.interval_secs) * self.interval_secs * 1000;
+
+        let candle = self.active_candles
+            .entry(symbol.to_string())
+            .or_insert_with(|| Candle::new(price, qty, window_start));
+
+        //检查是否开启了新的K线周期
+        if candle.start_time != window_start {
+            // 上一根K线结束了
+            println!("🕯️ [K线完成] {} - 0:{}, H:{}, L:{}, C:{}, V:{}", symbol, candle.open, candle.high, candle.low, candle.close, candle.volume);
+            
+            // 开启新K线
+            *candle = Candle::new(price, qty, window_start);
+        } else {
+            // 更新当前K线
+            candle.update(price, qty);
+        }
+    }
+}
 
 // 定义数据引擎
 struct DataEngine {
@@ -221,5 +308,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 启动系统
     kernel.start();
 
-    Ok(())
+    println!("🦀 Rust 启动，准备接收数据...");
+
+    // 初始化 ZMQ 上下文
+    let context = zmq::Context::new();
+    // 创建 PULL socket (负责拉取)
+    let socket = context.socket(zmq::SocketType::PULL)?;
+    
+    // 绑定地址 (要和 Python 的 connect 地址一致)
+    socket.bind("tcp://127.0.0.1:5555")?;
+    println!("✅ ZMQ 监听端口 5555 就绪");
+
+    let mut builder = CandleBuilder::new(60);
+
+    // 循环接收
+    loop {
+        // 接收消息
+        let mut msg = zmq::Message::new();
+        // recv(&mut msg) 会阻塞，直到收到数据
+        socket.recv(&mut msg, 0)?;
+
+        // 将二进制数据转为字符串
+        if let Ok(text) = String::from_utf8(msg.to_vec()) {
+            // 尝试解析 JSON
+            match serde_json::from_str::<TickData>(&text) {
+                Ok(tick) => {
+                    // 成功解析！
+                    println!("📈 [Rust 收到] 交易对: {}, 价格: {}, 数量: {}", 
+                             tick.symbol, tick.price, tick.qty);
+                    
+                    let price = tick.price.parse::<f64>().unwrap();
+                    let qty = tick.qty.parse::<f64>().unwrap();
+
+                    builder.on_tick(&tick.symbol, price, qty, tick.time);
+                },
+                Err(e) => {
+                    eprintln!("❌ JSON 解析错误: {:?}", e);
+                }
+            }
+        }
+    }
 }
